@@ -1,10 +1,29 @@
 # Store Procedure
 
+## sp_head 类
+
+存储过程对应的核心执行类
+
+```cpp
+/**
+  sp_head represents one instance of a stored program. It might be of any type
+  (stored procedure, function, trigger, event).
+*/
+
+核心成员:
+/// The SP-instructions.
+Mem_root_array<sp_instr *> m_instructions;  // 包含着 sp 对应的所有语句块
+```
+
+sp_head::execute call graph
+
+![sp_head::execute](img/classsp__head_a42a692195fb3636528697c091f4578e0_cgraph.png)
+
+execute 会调用各 sp_instr 的 execute 方法，完成 sp 的执行流程
+
 ## sp_instr 类
 
 ![sp_instr类图](img\sp_instr_class.png)
-
-[类图官网链接](https://dev.mysql.com/doc/dev/mysql-server/8.3.0/classsp__instr.html)
 
 ### 简单介绍
 
