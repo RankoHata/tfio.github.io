@@ -9,3 +9,5 @@
 [MySQL名词与缩写](./MySQL专有名词与缩写.md)
 
 [innobase_queryGraph源码解析](innobase_queryGraph源码解析.md)
+
+[MySQL SP Exception Handler Test Case](./MySQL_sp_handler_test.sql)
