@@ -11,3 +11,5 @@
 [innobase_queryGraph源码解析](innobase_queryGraph源码解析.md)
 
 [MySQL SP Exception Handler Test Case](./MySQL_sp_handler_test.sql)
+
+[MySQL Query Term解析](./MySQL_query_term解析.md)
