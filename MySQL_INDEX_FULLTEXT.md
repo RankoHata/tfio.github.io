@@ -1,5 +1,180 @@
 # 关于MySQL数据fulltext索引的一些梳理
 
+## fts_query流程梳理
+
+![sss](./img/mysql_fulltext/mysql_fulltext_fts_query.jpg)
+
+## 全文索引查询MVCC功能的验证与解析
+
+### 预置SQL
+
+```sql
+-- 为什么要显式使用 FTS_DOC_ID？因为当前select没找到好方法触发索引覆盖场景，只有FTS_DOC_ID能满足
+create table fts_mvcc_t1(FTS_DOC_ID BIGINT UNSIGNED AUTO_INCREMENT NOT NULL PRIMARY KEY, content text);
+
+-- 创建全文索引
+create fulltext index idx on fts_mvcc_t1(content);
+
+mysql> insert into fts_mvcc_t1(content) values ('good morn');
+Query OK, 1 row affected (0.00 sec)
+
+mysql> insert into fts_mvcc_t1(content) values ('good morn morn');
+Query OK, 1 row affected (0.00 sec)
+
+mysql> insert into fts_mvcc_t1(content) values ('good morn morn morn');
+Query OK, 1 row affected (0.00 sec)
+
+mysql> select * from fts_mvcc_t1;
++------------+---------------------+
+| FTS_DOC_ID | content             |
++------------+---------------------+
+|          1 | good morn           |
+|          2 | good morn morn      |
+|          3 | good morn morn morn |
++------------+---------------------+
+3 rows in set (0.01 sec)
+
+mysql> select *, match(content) against ('morn') from fts_mvcc_t1;
++------------+---------------------+---------------------------------+
+| FTS_DOC_ID | content             | match(content) against ('morn') |
++------------+---------------------+---------------------------------+
+|          1 | good morn           |      0.000000001885928302414186 |
+|          2 | good morn morn      |      0.000000003771856604828372 |
+|          3 | good morn morn morn |      0.000000005657784907242558 |
++------------+---------------------+---------------------------------+
+3 rows in set (0.01 sec)
+```
+
+### 用例
+
+| 事务A | 事务B |
+| --- | --- |
+| | begin |
+| | SQL1: select * from fts_mvcc_t1; |
+| | SQL2: select *, match(content) against('morn') from fts_mvcc_t1; |
+| begin |  |
+| update fts_mvcc_t1 set content = 'good morn morn morn morn', FTS_DOC_
+ID = 4 where FTS_DOC_ID = 2; | |
+| commit |  |
+| | SQL3: select * from fts_mvcc_t1; |
+| | SQL4: select *, match(content) against('morn') from fts_mvcc_t1; |
+| | SQL5: select FTS_DOC_ID from fts_mvcc_t1 where match(content) against('morn'); |
+| | SQL6: select FTS_DOC_ID from fts_mvcc_t1 order by match(content) against('morn') desc; |
+| | SQL7: select FTS_DOC_ID from fts_mvcc_t1 where match(content) against('morn') order by match(content) against('morn') desc; |
+| | commit |
+
+### 执行结果
+
+```sql
+-- SQL1: update前查询正常
+mysql> select * from fts_mvcc_t1;
++------------+---------------------+
+| FTS_DOC_ID | content             |
++------------+---------------------+
+|          1 | good morn           |
+|          2 | good morn morn      |
+|          3 | good morn morn morn |
++------------+---------------------+
+3 rows in set (0.00 sec)
+
+-- SQL2: update前评分正常
+mysql> select *, match(content) against('morn') from fts_mvcc_t1;
++------------+---------------------+--------------------------------+
+| FTS_DOC_ID | content             | match(content) against('morn') |
++------------+---------------------+--------------------------------+
+|          1 | good morn           |     0.000000001885928302414186 |
+|          2 | good morn morn      |     0.000000003771856604828372 |
+|          3 | good morn morn morn |     0.000000005657784907242558 |
++------------+---------------------+--------------------------------+
+3 rows in set (0.00 sec)
+
+-- SQL3: update后根据MVCC可见性，查询结果正常，update操作不可见
+mysql> select * from fts_mvcc_t1;
++------------+---------------------+
+| FTS_DOC_ID | content             |
++------------+---------------------+
+|          1 | good morn           |
+|          2 | good morn morn      |
+|          3 | good morn morn morn |
++------------+---------------------+
+3 rows in set (0.00 sec)
+
+-- SQL4: 结果不正常，content字段符合MVCC，udpate修改的数据不可见
+-- 但是评分明显已经按照修改后的评分显示
+-- 见到了不应该见到的修改（此处见不到ID为4的，其实是因为回表）
+mysql> select *, match(content) against('morn') from fts_mvcc_t1;
++------------+---------------------+--------------------------------+
+| FTS_DOC_ID | content             | match(content) against('morn') |
++------------+---------------------+--------------------------------+
+|          1 | good morn           |     0.000000001885928302414186 |
+|          2 | good morn morn      |                              0 |
+|          3 | good morn morn morn |     0.000000005657784907242558 |
++------------+---------------------+--------------------------------+
+
+-- SQL5: 结果不正常，使用where条件查询，并且满足索引覆盖场景，看到了update之后的数据 ID=4
+mysql> select FTS_DOC_ID from fts_mvcc_t1 where match(content) against('morn');
++------------+
+| FTS_DOC_ID |
++------------+
+|          4 |
+|          3 |
+|          1 |
++------------+
+3 rows in set (0.00 sec)
+
+-- SQL6: 结果不正常，因为如果符合MVCC，排序的结果应该是 3 2 1
+-- 此处2的结果已经使用的更新后的值，所以顺序为 3 1 2
+mysql> select FTS_DOC_ID from fts_mvcc_t1 order by match(content) against('morn') desc;
++------------+
+| FTS_DOC_ID |
++------------+
+|          3 |
+|          1 |
+|          2 |
++------------+
+
+-- SQL7: 结果不正常，使用where条件查询，并且满足索引覆盖场景，看到了update之后的数据 ID=4
+mysql> select FTS_DOC_ID from fts_mvcc_t1 where match(content) against('morn') order by match(content) against('morn') desc;
++------------+
+| FTS_DOC_ID |
++------------+
+|          4 |
+|          3 |
+|          1 |
++------------+
+3 rows in set (0.00 sec)
+```
+
+## 全文索引查询核心函数解析(待补充)
+
+### fts_query
+
+这个函数实在判定为会使用fts时就会执行，在fts_init的逻辑内，类似于prepare
+对于后续的执行操作，可能由于SQL的不同，或调 ft_read 获取一行行数据，或者调 count，或者调 innobase_fts_find_ranking 函数获取单个docId的分数等;
+
+```cpp
+函数签名：
+/** FTS Query entry point.
+@param[in]	trx		transaction
+@param[in]	index		fts index to search
+@param[in]	flags		FTS search mode  模式，包括什么 SORTED, NO_RANKING 啥的
+@param[in]	query_str	FTS query  对应的文档字符串
+@param[in]	query_len	FTS query string len in bytes  文档长度
+@param[in,out]	result		result doc ids  整个函数最终的目的就是填充这个 result
+@param[in]	limit		limit value  limit限制，注意这里并不是select指定的limit，只有在NO_RANKING的场景下才有用
+@return DB_SUCCESS if successful otherwise error code */
+dberr_t
+fts_query(
+	trx_t*		trx,
+	dict_index_t*	index,
+	uint		flags,
+	const byte*	query_str,
+	ulint		query_len,
+	fts_result_t**	result,
+	ulonglong	limit)
+	MY_ATTRIBUTE((warn_unused_result));
+```
+
 ## 简单查询对应的执行计划与源码简单分析记录
 
 ### 表结构
