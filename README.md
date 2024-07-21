@@ -13,3 +13,5 @@
 [MySQL SP Exception Handler Test Case](./MySQL_sp_handler_test.sql)
 
 [MySQL Query Term解析](./MySQL_query_term解析.md)
+
+[MySQL FULLTEXT INDEX](./MySQL_INDEX_FULLTEXT.md)
