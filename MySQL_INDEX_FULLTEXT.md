@@ -1,4 +1,304 @@
-# 关于MySQL数据fulltext索引的一些梳理
+# 关于MySQL数据库fulltext索引的一些梳理
+
+## MySQL特殊事务处理机制验证与分析
+
+在 MySQL 官方文档中存在一个关于数据可见性的特殊描述：
+
+> **InnoDB Full-Text Index Transaction Handling**
+> InnoDB full-text indexes have special transaction handling characteristics due its caching and batch processing behavior. **Specifically, updates and insertions on a full-text index are processed at transaction commit time, which means that a full-text search can only see committed data.** The following example demonstrates this behavior. The full-text search only returns a result after the inserted lines are committed.
+
+即 MySQL 是在事务 commit 阶段才完成索引数据的实际写入。所以才会出现：
+
+1. 事务修改，事务内不可见的情况
+
+2. rollback 场景无需考虑，commit 才提交数据，不存在 rollback 的可能
+
+但是真的没有问题吗？例如：
+
+1. 比如 commit 阶段提交数据，也没法保证原子操作，是不是意味着存在一些场景会有不一致问题？
+
+2. commit 阶段可以失败吗？毕竟会涉及磁盘读写等操作，存在失败可能，如果失败整个事务该如何？
+
+下面就对这2个问题进行一些测试与分析
+
+> 使用 MySQL 8.0 进行验证
+
+其实从源码上可以简单看出，其 commit 阶段是不能正常返回错误码的，出现无法处理的错误只能自杀，FTS相关的操作代码嵌入在 commit 函数中，一旦出现了非预期的情况，直接执行 ut_error，这个方法会导致数据库直接中断退出
+
+```cpp
+void trx_commit_low(trx_t *trx, mtr_t *mtr) {
+  /* undo_no is non-zero if we're doing the final commit. */
+  if (trx->fts_trx != nullptr && trx->undo_no != 0 &&
+      trx->lock.que_state != TRX_QUE_ROLLING_BACK) {
+    dberr_t error;
+
+    ut_a(!trx_is_autocommit_non_locking(trx));
+
+    error = fts_commit(trx);  // FTS相关的操作
+
+    /* FTS-FIXME: Temporarily tolerate DB_DUPLICATE_KEY
+    instead of dying. This is a possible scenario if there
+    is a crash between insert to DELETED table committing
+    and transaction committing. The fix would be able to
+    return error from this function */
+    if (error != DB_SUCCESS && error != DB_DUPLICATE_KEY) {
+      /* FTS-FIXME: once we can return values from this
+      function, we should do so and signal an error
+      instead of just dying. */
+
+      ut_error;  // 自杀退出
+    }
+  }
+  // ...
+}
+```
+
+### 验证在 commit 阶段出现异常的场景
+
+测试思路：在进入 commit阶段后，fts_commit 真正执行杀死数据库，这样索引操作并没有真正执行，查看数据库是否符合预期
+
+预置数据
+
+```sql
+create table tf1(a int primary key, content text);
+insert into tf1 values(1, 'hello');
+insert into tf1 values(2, 'hello hello');
+create fulltext index idx on tf1(content);
+
+mysql> select *, match(content) against ('hello') as score from tf1;
++---+-------------+----------------------------+
+| a | content     | score                      |
++---+-------------+----------------------------+
+| 1 | hello       | 0.000000001885928302414186 |
+| 2 | hello hello | 0.000000003771856604828372 |
++---+-------------+----------------------------+
+2 rows in set (0.01 sec)
+```
+
+#### 测试 insert commit 中断崩溃的场景
+
+测试步骤：
+
+1. gdb 设置断点 fts_commit
+2. 执行SQL: insert into tf1 values(3, 'hello hello hello');
+3. gdb 挂住断点后，kill -9 杀死数据库
+4. 重启数据库，查看数据
+
+重启后查询发现结果正常：
+
+```sql
+mysql> select *, match(content) against ('hello') as score from tf1;
++---+-------------------+----------------------+
+| a | content           | score                |
++---+-------------------+----------------------+
+| 1 | hello             | 0.031008131802082062 |
+| 2 | hello hello       | 0.062016263604164124 |
+| 3 | hello hello hello |  0.09302439540624619 |
++---+-------------------+----------------------+
+3 rows in set (0.01 sec)
+
+mysql> select count(1) from tf1 where match(content) against ('hello');
++----------+
+| count(1) |
++----------+
+|        3 |
++----------+
+1 row in set (0.01 sec)
+```
+
+虽然索引操作没有执行完成就发生了崩溃，但是依赖于恢复逻辑，在重启数据库后操作ft索引，重新根据数据又生成了索引数据。
+
+#### 测试 delete commit 中断崩溃的场景
+
+**注意：最好是重新创建表，再测试，保证已有数据都sync，才能测试出问题，否则会因为没有sync，重启触发重新插入，此时已删除的数据是不会重插的**
+
+测试步骤：
+
+1. gdb 设置断点 fts_commit
+2. 执行SQL: delete from tf1 where a = 1;
+3. gdb 挂住断点后，kill -9 杀死数据库
+4. 重启数据库，查看数据
+
+重启后查询发现结果不正常：
+
+```sql
+mysql> select *, match(content) against ('hello') as score from tf1;
++---+-------------+----------------------------+
+| a | content     | score                      |
++---+-------------+----------------------------+
+| 2 | hello hello | 0.000000003771856604828372 |
++---+-------------+----------------------------+
+1 row in set (0.00 sec)
+
+mysql> select count(1) from tf1 where match(content) against ('hello');
++----------+
+| count(1) |
++----------+
+|        2 |
++----------+
+1 row in set (0.01 sec)
+
+mysql> SET GLOBAL innodb_ft_aux_table = 'test/tf1';
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> SELECT * FROM INFORMATION_SCHEMA.INNODB_FT_INDEX_TABLE;
++-------+--------------+-------------+-----------+--------+----------+
+| WORD  | FIRST_DOC_ID | LAST_DOC_ID | DOC_COUNT | DOC_ID | POSITION |
++-------+--------------+-------------+-----------+--------+----------+
+| hello |            3 |           4 |         2 |      3 |        0 |
+| hello |            3 |           4 |         2 |      4 |        0 |
+| hello |            3 |           4 |         2 |      4 |        6 |
++-------+--------------+-------------+-----------+--------+----------+
+3 rows in set (0.01 sec)
+
+mysql> SELECT * FROM INFORMATION_SCHEMA.INNODB_FT_DELETED;
+Empty set (0.00 sec)
+
+mysql> SELECT * FROM INFORMATION_SCHEMA.INNODB_FT_INDEX_CACHE;
+Empty set (0.00 sec)
+```
+
+当存在回表的场景下，结果正常，但是count(不会表的情况之一)结果明显存在错误，查出来不应该看到的数据，这就不符合 MySQL 文档中的描述，此时原tuple已经不可见，MySQL 认为这次删除已经提交，但是索引数据还是存在。
+
+通过 InnoDB 辅助表，也能看出索引辅助表中还存在已被删除的数据。
+
+##### 为什么会出现这样的情况？
+
+因为删除操作在 fts_commit 函数内会插入删除表，在执行之前core，会导致没有插入删除表，此时ft索引认为这条数据并没有被删除，所以出现了残留。
+
+##### optimize 是否能解决问题？
+
+```sql
+mysql> SET GLOBAL innodb_optimize_fulltext_only=ON;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> optimize table tf1;
++----------+----------+----------+----------+
+| Table    | Op       | Msg_type | Msg_text |
++----------+----------+----------+----------+
+| test.tf1 | optimize | status   | OK       |
++----------+----------+----------+----------+
+1 row in set (0.00 sec)
+
+mysql> select count(1) from tf1 where match(content) against ('hello');
++----------+
+| count(1) |
++----------+
+|        2 |
++----------+
+1 row in set (0.01 sec)
+
+mysql> SET GLOBAL innodb_optimize_fulltext_only=OFF;
+Query OK, 0 rows affected (0.00 sec)
+
+mysql> optimize table tf1;
++----------+----------+----------+-------------------------------------------------------------------+
+| Table    | Op       | Msg_type | Msg_text                                                          |
++----------+----------+----------+-------------------------------------------------------------------+
+| test.tf1 | optimize | note     | Table does not support optimize, doing recreate + analyze instead |
+| test.tf1 | optimize | status   | OK                                                                |
++----------+----------+----------+-------------------------------------------------------------------+
+2 rows in set (0.15 sec)
+
+mysql> select count(1) from tf1 where match(content) against ('hello');
++----------+
+| count(1) |
++----------+
+|        1 |
++----------+
+1 row in set (0.00 sec)
+```
+
+因为没有进入删除表，所以 fulltext only 的 optimize 不能解决问题，只有 optimize 整个表才能解决问题（类似于 vacuum full），重新构建。
+
+#### 测试 update commit 中断崩溃的场景
+
+> 对于 fulltext 索引，在 commit 阶段，update = delete + insert 所以不再赘述
+
+## MySQL fulltext 数据丢失问题分析
+
+全文索引中使用插入缓存，每次sync会将缓存中最大的docId作为synced_id下刷，下次恢复会从synced_id开始恢复，在synced_id之前的数据都认为已经下刷完成，不再处理。
+
+此处存在一个问题，在下刷时，作为synced_id的docId一定是正确的吗？
+他能够保证在此之前的数据一定下刷了吗？
+
+### 构造场景尝试验证
+
+#### 预置语句
+
+```sql
+create table tf1(a int primary key, content text);
+create fulltext index idx on tf1(content);
+
+drop procedure if exists gen_test;
+
+delimiter $$
+
+create procedure gen_test()
+begin
+    declare i int;
+    set i = 10;
+    while (i <= 50000) do
+        insert into tf1 values(i, 'Deleting a record that has a full-text index column could result in numerous small deletions in the auxiliary index tables, making concurrent access to these tables a point of contention. To avoid this problem, the DOC_ID of a deleted document is logged in a');
+        set i = i + 1;
+    end while;
+end$$
+
+delimiter ;
+```
+
+#### 测试步骤
+
+1. 开启事务，执行SQL语句
+
+| 事务A | 事务B |
+| --- | --- |
+| begin; | |
+| insert into tf1 values(1, 'hello hello'); | |
+| insert into tf1 values(2, 'hello hello hello'); | |
+| | call gen_test(); |
+| commit; | |
+
+2. 重启数据库
+
+3. 执行SQL语句查询结果
+
+```sql
+mysql> select count(1) from tf1 where match(content) against('hello');
++----------+
+| count(1) |
++----------+
+|        0 |
++----------+
+1 row in set (0.01 sec)
+
+mysql> select *, match(content) against('hello') from tf1 limit 2;
++---+-------------------+---------------------------------+
+| a | content           | match(content) against('hello') |
++---+-------------------+---------------------------------+
+| 1 | hello hello       |                               0 |
+| 2 | hello hello hello |                               0 |
++---+-------------------+---------------------------------+
+2 rows in set (0.00 sec)
+```
+
+#### 分析
+
+查询结果数据存在问题，明明相关的语句，但是评分却=0，判定为不相关。
+
+假设单独插入的两条数据对应的docId为 docId1, docId2
+
+事务A开启时候，执行了 insert 语句，分配了 docId，但是一直没有提交，又因为是在 commit 阶段才完成缓存的插入，所以这两行数据对应的 docId 一直没有插入缓存，另一个事务调用存储过程，插入了5w行数据，触发缓存下刷机制（数据数量不重要，只要能够触发cache sync机制即可），synced_id被刷新，synced_id > docId2 > docId1
+
+然后完成事务A的提交，docId1、docId2 刷入cache
+
+数据库重启之后，cache丢失，执行恢复逻辑，但是synced_id之前的数据并不会进行恢复，所以索引数据出现了丢失。
+
+#### 结论
+
+MySQL fulltext index 的实现存在漏洞，在重启的情况下，可能存在插入数据丢失的情况
+
+synced_id 判断的逻辑不准，并不能以 cache 下刷时的 max docId 作为 synced_id，会存在更小的 docId 还没来得及进入 cache!
 
 ## fts_query流程梳理
 
@@ -53,8 +353,7 @@ mysql> select *, match(content) against ('morn') from fts_mvcc_t1;
 | | SQL1: select * from fts_mvcc_t1; |
 | | SQL2: select *, match(content) against('morn') from fts_mvcc_t1; |
 | begin |  |
-| update fts_mvcc_t1 set content = 'good morn morn morn morn', FTS_DOC_
-ID = 4 where FTS_DOC_ID = 2; | |
+| update fts_mvcc_t1 set content = 'good morn morn morn morn', FTS_DOC_ID = 4 where FTS_DOC_ID = 2; | |
 | commit |  |
 | | SQL3: select * from fts_mvcc_t1; |
 | | SQL4: select *, match(content) against('morn') from fts_mvcc_t1; |
