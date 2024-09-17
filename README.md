@@ -15,3 +15,5 @@
 [MySQL Query Term解析](./MySQL_query_term解析.md)
 
 [MySQL FULLTEXT INDEX](./MySQL_INDEX_FULLTEXT.md)
+
+[algorithm summary](./summary.md)
