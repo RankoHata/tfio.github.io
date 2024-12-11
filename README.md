@@ -18,4 +18,4 @@
 
 [algorithm summary](./summary.md)
 
-[PostgreSQL-BTREE Index](./PG_BTREE_INDEX/PostgreSQL-BTREE%20Index.md)
+[PostgreSQL-BTREE Index](./PG_BTREE_INDEX/PostgreSQL-BTREE%20Index.pdf)
