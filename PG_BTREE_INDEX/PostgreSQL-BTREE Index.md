@@ -1,3 +1,7 @@
+---
+author: rankohata
+authorURL: https://github.com/RankoHata
+---
 # 理论基础
 
 ## 索引的基本概念
@@ -118,6 +122,7 @@ u <- allocate(1 new page for B)
 表示为内存块B申请一个新磁盘页面，赋值给指针u
 A,B <- rearrange old A, adding...
 表示将内存块A分裂为2个节点，内存块A、内存块B
+
 
 算法伪代码
 ![[Pasted image 20241208233914.webp]]
